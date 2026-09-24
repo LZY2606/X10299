@@ -84,6 +84,7 @@ from voluptuous.dataclasses_support import (
 # flake8: noqa
 # fmt: off
 from voluptuous.schema_builder import *
+from voluptuous.tracing import NO_VALUE, TraceEvent, TraceReport, ValidationTrace
 from voluptuous.util import *
 from voluptuous.validators import *
 

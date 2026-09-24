@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+**New**:
+
+* Add opt-in structured validation tracing via `Schema.validate_with_trace(data, redact=None)`. The returned `TraceReport` carries the same result/`MultipleInvalid` the default `Schema.__call__` would produce, plus a `ValidationTrace` describing which schema node each value passed through, generated defaults, coercions, `Any`/`All` branch outcomes, `Remove` drops and error aggregation. The default validation path (return values, exceptions, performance) is unchanged; validators are never executed twice and callers can redact sensitive values from the recorded trace.
+
 **Fixes**:
 
 * [#539](https://github.com/alecthomas/voluptuous/pull/539): Raise `Invalid` instead of leaking `TypeError`/`ValueError` for non-numeric input to the `Number` validator

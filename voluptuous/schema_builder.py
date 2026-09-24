@@ -6,15 +6,22 @@ import enum
 import inspect
 import itertools
 import re
+import threading
 import typing
 from collections.abc import Generator
 from contextlib import contextmanager
 from functools import cache, wraps
 
 from voluptuous import error as er
+from voluptuous import tracing
 from voluptuous.error import Error
 
 # fmt: on
+
+# Serializes lazy compilation of traced validator trees.  Traced
+# compilation is rare (once per Schema), so a single module-level lock
+# avoids adding per-instance lock overhead to Schema.
+_TRACED_COMPILE_LOCK = threading.Lock()
 
 # options for extra keys
 PREVENT_EXTRA = 0  # any extra key not in schema will raise an error
@@ -136,6 +143,10 @@ class Schema(object):
         self.required = required
         self.extra = int(extra)  # ensure the value is an integer
         self._compiled = self._compile(schema)
+        # Lazily built traced validator tree (see validate_with_trace).
+        # Kept separate from ``_compiled`` so the default validation
+        # path is never touched by tracing.
+        self._traced: typing.Optional[typing.Callable] = None
 
     @classmethod
     def infer(cls, data, **kwargs) -> Schema:
@@ -209,7 +220,91 @@ class Schema(object):
             raise er.MultipleInvalid([e])
             # return self.validate([], self.schema, data)
 
+    def validate_with_trace(
+        self,
+        data,
+        redact: typing.Optional[typing.Callable[[typing.Any], typing.Any]] = None,
+    ) -> tracing.TraceReport:
+        """Validate ``data`` and capture a structured validation trace.
+
+        This is an opt-in alternative entry point to :meth:`__call__`.
+        It never changes the behavior of :meth:`__call__`: validation
+        runs on a separately compiled validator tree, so every validator
+        is executed exactly once per call, just as in the default path.
+
+        :param data: The data to validate.
+        :param redact: Optional callable applied to every value before
+            it is stored in the trace, allowing callers to keep
+            sensitive originals out of the recorded events.  Redaction
+            only affects the trace, never the validated result.
+        :returns: A :class:`voluptuous.tracing.TraceReport`.  On success
+            ``report.value`` equals what ``schema(data)`` would return;
+            on failure ``report.error`` is the ``MultipleInvalid`` that
+            ``schema(data)`` would raise.  ``report.trace`` describes
+            which schema node each value passed through, generated
+            defaults, coercions, combinator branch outcomes, removals
+            and error aggregation.
+
+            >>> report = Schema({'a': All(Coerce(int), Any(1, 2))}).validate_with_trace({'a': '2'})
+            >>> report.ok, report.value
+            (True, {'a': 2})
+            >>> report = Schema(int).validate_with_trace('nope')
+            >>> report.ok, type(report.error).__name__
+            (False, 'MultipleInvalid')
+        """
+        compiled = self._traced_tree()
+        tracer = tracing.ValidationTrace(redact=redact)
+        token = tracing._active_tracer.set(tracer)
+        try:
+            try:
+                value = compiled([], data)
+            except er.MultipleInvalid as e:
+                return tracing.TraceReport(tracing.NO_VALUE, e, tracer)
+            except er.Invalid as e:
+                return tracing.TraceReport(
+                    tracing.NO_VALUE, er.MultipleInvalid([e]), tracer
+                )
+            return tracing.TraceReport(value, None, tracer)
+        finally:
+            # Close the trace and detach it from this context so a
+            # failed call can never leak events or state into a retry.
+            tracer.finish()
+            tracing._active_tracer.reset(token)
+
+    def _traced_tree(self) -> typing.Callable:
+        """Return the traced validator tree, compiling it once, lazily."""
+        traced = self._traced
+        if traced is None:
+            with _TRACED_COMPILE_LOCK:
+                traced = self._traced
+                if traced is None:
+                    traced = self._compile_traced_tree()
+                    self._traced = traced
+        return traced
+
+    def _compile_traced_tree(self) -> typing.Callable:
+        """Compile a trace-emitting copy of this schema's validator tree.
+
+        Reuses the exact same compilation logic as the default tree
+        (:meth:`_compile`); the active compile registry only wraps each
+        compiled node with an event-emitting layer.
+        """
+        registry = tracing._CompileRegistry()
+        token = tracing._compile_registry.set(registry)
+        try:
+            return self._compile(self.schema)
+        finally:
+            tracing._compile_registry.reset(token)
+
     def _compile(self, schema):
+        registry = tracing._compile_registry.get(None)
+        if registry is None:
+            return self._compile_node(schema)
+        with registry.node(schema) as node:
+            compiled = self._compile_node(schema)
+        return tracing._wrap_compiled(node, compiled)
+
+    def _compile_node(self, schema):
         if schema is Extra:
             return lambda _, v: v
         if schema is Self:
@@ -238,6 +333,13 @@ class Schema(object):
     def _compile_mapping(self, schema, invalid_msg=None):
         """Create validator for given mapping."""
         invalid_msg = invalid_msg or 'mapping value'
+
+        # When this mapping is compiled as part of a traced validator
+        # tree, capture its stable node identity so default generation
+        # and removals can be reported.  In the default tree this stays
+        # None and the recording branches below are never taken.
+        _trace_registry = tracing._compile_registry.get(None)
+        trace_node = _trace_registry.current if _trace_registry is not None else None
 
         # Keys that may be required
         all_required_keys = set(
@@ -306,7 +408,12 @@ class Schema(object):
                 ):
                     # A default value has been specified for this missing
                     # key, insert it.
-                    key_value_map[key.schema] = key.default()
+                    default_value = key.default()
+                    key_value_map[key.schema] = default_value
+                    if trace_node is not None:
+                        tracing.record_default(
+                            trace_node, path, key.schema, default_value
+                        )
 
             errors = []
 
@@ -358,6 +465,8 @@ class Schema(object):
                             out[new_key] = cval
                         else:
                             remove_key = True
+                            if trace_node is not None:
+                                tracing.record_removed(trace_node, key_path, value)
                             continue
                     except er.MultipleInvalid as e:
                         exception_errors.extend(e.errors)
@@ -593,6 +702,10 @@ class Schema(object):
         _compiled = [self._compile(s) for s in schema]
         seq_type_name = seq_type.__name__
 
+        # See _compile_mapping: only set when compiling a traced tree.
+        _trace_registry = tracing._compile_registry.get(None)
+        trace_node = _trace_registry.current if _trace_registry is not None else None
+
         def validate_sequence(path, data):
             if not isinstance(data, seq_type):
                 raise er.SequenceTypeInvalid('expected a %s' % seq_type_name, path)
@@ -617,6 +730,8 @@ class Schema(object):
                         cval = validate(index_path, value)
                         if cval is not Remove:  # do not include Remove values
                             out.append(cval)
+                        elif trace_node is not None:
+                            tracing.record_removed(trace_node, index_path, value)
                         break
                     except er.Invalid as e:
                         if len(e.path) > len(index_path):

@@ -250,23 +250,29 @@ class _WithSubValidators(object):
         self.discriminant = discriminant
 
     def __voluptuous_compile__(self, schema: Schema) -> typing.Callable:
-        self._compiled = []
+        compiled = []
         old_required = schema.required
         self.schema = schema
         for v in self.validators:
             schema.required = self.required
-            self._compiled.append(schema._compile(v))
+            compiled.append(schema._compile(v))
         schema.required = old_required
-        return self._run
+        self._compiled = compiled
 
-    def _run(self, path: typing.List[typing.Hashable], value):
-        if self.discriminant is not None:
-            self._compiled = [
-                self.schema._compile(v)
-                for v in self.discriminant(value, self.validators)
-            ]
+        def _run(path: typing.List[typing.Hashable], value, _compiled=compiled):
+            if self.discriminant is not None:
+                return self._exec(
+                    [
+                        self.schema._compile(v)
+                        for v in self.discriminant(value, self.validators)
+                    ],
+                    value,
+                    path,
+                )
 
-        return self._exec(self._compiled, value, path)
+            return self._exec(_compiled, value, path)
+
+        return _run
 
     def __call__(self, v):
         return self._exec((Schema(val) for val in self.validators), v)
