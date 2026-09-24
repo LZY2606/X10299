@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from functools import cache, wraps
 
 from voluptuous import error as er
+from voluptuous import trace as _trace
 from voluptuous.error import Error
 
 # fmt: on
@@ -199,40 +200,69 @@ class Schema(object):
             id(self),
         )
 
-    def __call__(self, data):
-        """Validate data against this schema."""
-        try:
-            return self._compiled([], data)
-        except er.MultipleInvalid:
-            raise
-        except er.Invalid as e:
-            raise er.MultipleInvalid([e])
-            # return self.validate([], self.schema, data)
+    def __call__(self, data, trace=None):
+        """Validate data against this schema.
 
-    def _compile(self, schema):
+        Pass ``trace=`` a :class:`voluptuous.trace.ValidationTrace` to opt in
+        to structured provenance recording.  Without it this is exactly the
+        original call: same return value, same exceptions, same compiled path.
+        """
+        return self._validate(data, trace=trace)
+
+    def _validate(self, data, trace=None, _nested=False):
+        # A compiled callable (a Marker, or a nested Schema inside Any/All)
+        # may re-enter validation.  It binds the *same* trace through the
+        # context variable so provenance is joined rather than restarted.
+        ambient = _trace.active_trace()
+        if trace is None:
+            trace = ambient
+        owns_binding = trace is not None and ambient is None and not _nested
+        if owns_binding:
+            token = _trace.bind_trace(trace)
+        try:
+            try:
+                result = self._compiled([], data, trace)
+            except er.MultipleInvalid:
+                raise
+            except er.Invalid as e:
+                raise er.MultipleInvalid([e])
+            if owns_binding:
+                trace.finish_ok([], result)
+            return result
+        except er.Invalid as e:
+            if owns_binding:
+                trace.finish_error([], e)
+            raise
+        finally:
+            if owns_binding:
+                _trace.reset_trace(token)
+
+    def _compile(self, schema, node_path=()):
         if schema is Extra:
-            return lambda _, v: v
+            return lambda _, v, trace=None: v
         if schema is Self:
-            return lambda p, v: self._compiled(p, v)
+            def _validate_self(p, v, trace=None):
+                return self._compiled(p, v, trace)
+            return _validate_self
         elif hasattr(schema, "__voluptuous_compile__"):
-            return schema.__voluptuous_compile__(self)
+            return schema.__voluptuous_compile__(self, node_path)
         if isinstance(schema, Object):
-            return self._compile_object(schema)
+            return self._compile_object(schema, node_path)
         if isinstance(schema, collections.abc.Mapping):
-            return self._compile_dict(schema)
+            return self._compile_dict(schema, node_path)
         elif isinstance(schema, list):
-            return self._compile_list(schema)
+            return self._compile_list(schema, node_path)
         elif isinstance(schema, tuple):
-            return self._compile_tuple(schema)
+            return self._compile_tuple(schema, node_path)
         elif isinstance(schema, (frozenset, set)):
-            return self._compile_set(schema)
+            return self._compile_set(schema, node_path)
         elif isinstance(schema, enum.Enum):
-            return _compile_scalar(schema)
+            return _compile_scalar(schema, node_path)
         type_ = type(schema)
         if inspect.isclass(schema):
             type_ = schema
         if type_ in (*primitive_types, object, type(None)) or callable(schema):
-            return _compile_scalar(schema)
+            return _compile_scalar(schema, node_path)
         raise er.SchemaError('unsupported schema data type %r' % type(schema).__name__)
 
     def _compile_mapping(self, schema, invalid_msg=None):
