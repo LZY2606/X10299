@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from functools import cache, wraps
 
 from voluptuous import error as er
+from voluptuous import trace as _trace
 from voluptuous.error import Error
 
 # fmt: on
@@ -199,43 +200,109 @@ class Schema(object):
             id(self),
         )
 
-    def __call__(self, data):
-        """Validate data against this schema."""
-        try:
-            return self._compiled([], data)
-        except er.MultipleInvalid:
-            raise
-        except er.Invalid as e:
-            raise er.MultipleInvalid([e])
-            # return self.validate([], self.schema, data)
+    def __call__(self, data, trace=None):
+        """Validate data against this schema.
 
-    def _compile(self, schema):
+        When ``trace`` is a :class:`voluptuous.trace.Trace` instance the call
+        additionally produces a structured validation trace on that object.
+        Without it, this is exactly the historical code path: same return
+        values, same exception objects, no per-call trace state.
+        """
+        if trace is None:
+            try:
+                return self._compiled([], data)
+            except er.MultipleInvalid:
+                raise
+            except er.Invalid as e:
+                raise er.MultipleInvalid([e])
+        activated = trace.activate()
+        with activated:
+            try:
+                return self._compiled([], data)
+            except er.MultipleInvalid:
+                raise
+            except er.Invalid as e:
+                raise er.MultipleInvalid([e])
+
+    def _labeled(self, node_id, label, flavor, func):
+        """Bind a stable node identity to a compiled validator.
+
+        The wrapper performs the single existing validation call; tracing
+        only observes that call, it never invokes ``func`` a second time.
+        """
+
+        child_node = node_id + (label,)
+
+        def validate_labeled(path, value):
+            recorder = _trace.current_recorder()
+            if recorder is None:
+                return func(path, value)
+            return recorder.run_node(
+                child_node[-1], flavor, func, path, value
+            )
+
+        validate_labeled._trace_node = child_node
+        validate_labeled._trace_flavor = flavor
+        return validate_labeled
+
+    def _compile(self, schema, node_id=('root',)):
         if schema is Extra:
-            return lambda _, v: v
+            return self._labeled(
+                node_id, 'extra', 'extra', lambda _, v: v
+            )
         if schema is Self:
-            return lambda p, v: self._compiled(p, v)
+
+            def validate_self(p, v):
+                return self._compiled(p, v)
+
+            return self._labeled(node_id, 'self', 'self', validate_self)
         elif hasattr(schema, "__voluptuous_compile__"):
-            return schema.__voluptuous_compile__(self)
+            compiled = schema.__voluptuous_compile__(self, node_id)
+            return self._labeled(
+                node_id,
+                _trace.node_label(schema),
+                getattr(compiled, '_trace_flavor', 'composite'),
+                compiled,
+            )
         if isinstance(schema, Object):
-            return self._compile_object(schema)
+            compiled = self._compile_object(schema, node_id)
+            return self._labeled(node_id, 'object', 'object', compiled)
         if isinstance(schema, collections.abc.Mapping):
-            return self._compile_dict(schema)
+            compiled = self._compile_dict(schema, node_id)
+            return self._labeled(node_id, 'mapping', 'mapping', compiled)
         elif isinstance(schema, list):
-            return self._compile_list(schema)
+            compiled = self._compile_list(schema, node_id)
+            return self._labeled(node_id, 'list', 'sequence', compiled)
         elif isinstance(schema, tuple):
-            return self._compile_tuple(schema)
+            compiled = self._compile_tuple(schema, node_id)
+            return self._labeled(node_id, 'tuple', 'sequence', compiled)
         elif isinstance(schema, (frozenset, set)):
-            return self._compile_set(schema)
+            compiled = self._compile_set(schema, node_id)
+            return self._labeled(
+                node_id, type(schema).__name__, 'set', compiled
+            )
         elif isinstance(schema, enum.Enum):
-            return _compile_scalar(schema)
+            return _compile_scalar(
+                schema, node_id, 'literal', _trace.node_label(schema)
+            )
         type_ = type(schema)
         if inspect.isclass(schema):
             type_ = schema
-        if type_ in (*primitive_types, object, type(None)) or callable(schema):
-            return _compile_scalar(schema)
+        if type_ in primitive_types or type_ is object or type_ is type(None):
+            return _compile_scalar(
+                schema, node_id, 'type', _trace.node_label(schema)
+            )
+        if callable(schema):
+            from voluptuous.validators import Coerce as _Coerce
+
+            if isinstance(schema, _Coerce):
+                flavor, label = 'coerce', _trace.node_label(schema)
+            else:
+                flavor, label = 'callable', _trace.node_label(schema)
+            return _compile_scalar(schema, node_id, flavor, label)
         raise er.SchemaError('unsupported schema data type %r' % type(schema).__name__)
 
-    def _compile_mapping(self, schema, invalid_msg=None):
+    def _compile_mapping(self, schema, node_id, invalid_msg=None):
         """Create validator for given mapping."""
         invalid_msg = invalid_msg or 'mapping value'
 
@@ -265,9 +332,15 @@ class Schema(object):
         )
 
         _compiled_schema = {}
-        for skey, svalue in schema.items():
-            new_key = self._compile(skey)
-            new_value = self._compile(svalue)
+        # Stable structural labels follow schema declaration order, never
+        # dict enumeration of input data; a positional index disambiguates
+        # duplicated key literals.
+        field_labels = {}
+        for index, (skey, svalue) in enumerate(schema.items()):
+            label = '%d:%s' % (index, _trace.node_label(skey))
+            field_labels[skey] = label
+            new_key = self._compile(skey, node_id + (label, 'key'))
+            new_value = self._compile(svalue, node_id + (label, 'value'))
             _compiled_schema[skey] = (new_key, new_value)
 
         candidates = list(_iterate_mapping_candidates(_compiled_schema))
@@ -289,6 +362,7 @@ class Schema(object):
                 additional_candidates.append((skey, (ckey, cvalue)))
 
         def validate_mapping(path, iterable, out):
+            recorder = _trace.current_recorder()
             required_keys = all_required_keys.copy()
 
             # Build a map of all provided key-value pairs.
@@ -306,7 +380,23 @@ class Schema(object):
                 ):
                     # A default value has been specified for this missing
                     # key, insert it.
-                    key_value_map[key.schema] = key.default()
+                    default_value = key.default()
+                    key_value_map[key.schema] = default_value
+                    if recorder is not None:
+                        recorder.stack.extend(
+                            (field_labels[key], 'value', 'default')
+                        )
+                        recorder.record_default(
+                            'default'
+                            if not isinstance(key, Remove)
+                            else type(key).__name__.lower(),
+                            key.schema,
+                            path + [key.schema],
+                            default_value,
+                        )
+                        recorder.stack[-3:] = []
+                        recorder.stack.pop()
+                        recorder.stack.pop()
 
             errors = []
 
@@ -358,6 +448,8 @@ class Schema(object):
                             out[new_key] = cval
                         else:
                             remove_key = True
+                            if recorder is not None:
+                                recorder.record_remove(key, key_path)
                             continue
                     except er.MultipleInvalid as e:
                         exception_errors.extend(e.errors)
@@ -389,12 +481,24 @@ class Schema(object):
                         continue
                     elif self.extra == ALLOW_EXTRA:
                         out[key] = value
+                        if recorder is not None:
+                            recorder.record_extra(
+                                'allow', key_path, key=key
+                            )
                     elif self.extra == REMOVE_EXTRA:
                         #  ignore the key so it's removed from output
+                        if recorder is not None:
+                            recorder.record_extra(
+                                'drop', key_path, key=key
+                            )
                         continue
                     elif error:
                         errors.append(error)
                     else:
+                        if recorder is not None:
+                            recorder.record_extra(
+                                'prevent', key_path, key=key
+                            )
                         errors.append(er.Invalid('extra keys not allowed', key_path))
 
             # for any required keys left that weren't found and don't have defaults:
@@ -406,6 +510,8 @@ class Schema(object):
                 )
                 errors.append(er.RequiredFieldInvalid(msg, path + [key]))
             if errors:
+                if recorder is not None:
+                    recorder.record_error_group(errors, path)
                 raise er.MultipleInvalid(errors)
 
             return out
