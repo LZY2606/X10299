@@ -13,6 +13,7 @@ from functools import cache, wraps
 
 from voluptuous import error as er
 from voluptuous.error import Error
+from voluptuous import trace as _trace
 
 # fmt: on
 
@@ -135,7 +136,40 @@ class Schema(object):
         self.schema: typing.Any = schema
         self.required = required
         self.extra = int(extra)  # ensure the value is an integer
+        self._trace_support = None
+        self._trace_lock = __import__('threading').Lock()
         self._compiled = self._compile(schema)
+
+    @classmethod
+    def _traced_new(cls, schema, required, extra):
+        """Build an instrumented clone without running ``__init__`` twice.
+
+        The clone compiles the exact same schema tree with the trace support
+        object attached, so traced validation reuses the production
+        algorithms instead of carrying a test-only copy of them.
+        """
+        instance = cls.__new__(cls)
+        instance.schema = schema
+        instance.required = required
+        instance.extra = int(extra)
+        instance._trace_lock = __import__('threading').Lock()
+        support = _trace._TraceSupport(_trace._TraceRoot())
+        instance._trace_support = support
+        instance._compiled = instance._compile(schema)
+        support.compiled = instance._compiled
+        return instance
+
+    def _traced_clone(self):
+        support = self._trace_support
+        if support is None:
+            with self._trace_lock:
+                support = self._trace_support
+                if support is None:
+                    support = type(self)._traced_new(
+                        self.schema, self.required, self.extra
+                    )._trace_support
+                    self._trace_support = support
+        return support
 
     @classmethod
     def infer(cls, data, **kwargs) -> Schema:
@@ -199,8 +233,10 @@ class Schema(object):
             id(self),
         )
 
-    def __call__(self, data):
+    def __call__(self, data, trace=None):
         """Validate data against this schema."""
+        if trace is not None and trace is not False:
+            return self._validate_traced(data, trace)
         try:
             return self._compiled([], data)
         except er.MultipleInvalid:
@@ -209,11 +245,38 @@ class Schema(object):
             raise er.MultipleInvalid([e])
             # return self.validate([], self.schema, data)
 
+    def _validate_traced(self, data, trace):
+        if trace is True:
+            trace = _trace.Trace()
+            owned = True
+        else:
+            owned = False
+        if not isinstance(trace, _trace.Trace):
+            raise TypeError(
+                'trace must be True, False, or a voluptuous.trace.Trace'
+            )
+        support = self._traced_clone()
+        support.root.bind(trace)
+        with trace._run_guard():
+            try:
+                result = support.compiled([], data)
+            except er.Invalid as error:
+                trace._fail(error)
+                raise
+        trace._succeed(result)
+        # When callers pass trace=True they get no Trace object back, so the
+        # run behaves exactly like a normal validation apart from executing
+        # the instrumented closures.
+        return result
+
     def _compile(self, schema):
+        support = getattr(self, '_trace_support', None)
         if schema is Extra:
             return lambda _, v: v
         if schema is Self:
             return lambda p, v: self._compiled(p, v)
+        if support is not None:
+            return self._compile_traced(schema, support)
         elif hasattr(schema, "__voluptuous_compile__"):
             return schema.__voluptuous_compile__(self)
         if isinstance(schema, Object):
@@ -232,10 +295,50 @@ class Schema(object):
         if inspect.isclass(schema):
             type_ = schema
         if type_ in (*primitive_types, object, type(None)) or callable(schema):
-            return _compile_scalar(schema)
+            return _compile_scalar(schema, support)
         raise er.SchemaError('unsupported schema data type %r' % type(schema).__name__)
 
-    def _compile_mapping(self, schema, invalid_msg=None):
+    def _compile_with(self, schema, support):
+        """Compile ``schema`` with an explicit trace scope.
+
+        The traced clone uses this to attach stable structural prefixes to
+        child nodes (mapping keys, sequence items).  The compiled closures
+        themselves are produced by the same ``_compile_*`` methods used on
+        the default path.
+        """
+        previous = self._trace_support
+        self._trace_support = support
+        try:
+            return self._compile(schema)
+        finally:
+            self._trace_support = previous
+
+    def _compile_traced(self, schema, support):
+        """Compile ``schema`` with observer instrumentation attached.
+
+        Only used by traced clones; ordinary :class:`Schema` instances never
+        enter this method, which keeps the default validation path byte for
+        byte the same.
+        """
+        if hasattr(schema, '__voluptuous_compile_trace__'):
+            return schema.__voluptuous_compile_trace__(self, support)
+        if isinstance(schema, Object):
+            raw = self._compile_object(schema, support)
+        elif isinstance(schema, collections.abc.Mapping):
+            raw = self._compile_dict(schema, support)
+        elif isinstance(schema, list):
+            raw = self._compile_list(schema, support)
+        elif isinstance(schema, tuple):
+            raw = self._compile_tuple(schema, support)
+        elif isinstance(schema, (frozenset, set)):
+            raw = self._compile_set(schema, support)
+        else:
+            raw = _compile_scalar(schema, support)
+        kind, segment, label = _describe_node(schema)
+        node_id = support.register(kind, segment, label, schema)
+        return support.wrap(node_id, raw)
+
+    def _compile_mapping(self, schema, invalid_msg=None, support=None):
         """Create validator for given mapping."""
         invalid_msg = invalid_msg or 'mapping value'
 
@@ -265,9 +368,33 @@ class Schema(object):
         )
 
         _compiled_schema = {}
+        # Structural position of each schema key, independent of dict
+        # enumeration order: sorted literal labels give the same node ids on
+        # every run even for schemas built from dicts with equal entries.
+        trace_default_nodes = {}
+        trace_key_segments = {}
         for skey, svalue in schema.items():
-            new_key = self._compile(skey)
-            new_value = self._compile(svalue)
+            if support is not None:
+                segment = 'key:' + _structural_label(skey)
+                child = support.child(segment)
+                trace_key_segments[skey] = segment
+                new_key = self._compile_with(skey, child)
+                new_value = self._compile_with(
+                    svalue, child.child('value')
+                )
+                marker = skey if isinstance(skey, Marker) else None
+                if (
+                    marker is not None
+                    and not isinstance(marker.default, Undefined)
+                ):
+                    default_id = child.register(
+                        'default', 'default', 'default for %r' % (marker.schema,),
+                        marker,
+                    )
+                    trace_default_nodes[marker] = default_id
+            else:
+                new_key = self._compile(skey)
+                new_value = self._compile(svalue)
             _compiled_schema[skey] = (new_key, new_value)
 
         candidates = list(_iterate_mapping_candidates(_compiled_schema))
@@ -306,7 +433,16 @@ class Schema(object):
                 ):
                     # A default value has been specified for this missing
                     # key, insert it.
-                    key_value_map[key.schema] = key.default()
+                    produced = key.default()
+                    key_value_map[key.schema] = produced
+                    default_id = trace_default_nodes.get(key)
+                    if default_id is not None:
+                        _trace._TraceSupport.emit(
+                            _trace.DEFAULT,
+                            default_id,
+                            path + [key.schema],
+                            produced,
+                        )
 
             errors = []
 
@@ -358,6 +494,14 @@ class Schema(object):
                             out[new_key] = cval
                         else:
                             remove_key = True
+                            removed_id = getattr(ckey, '_trace_node_id', None)
+                            if removed_id is not None:
+                                _trace._TraceSupport.emit(
+                                    _trace.REMOVED,
+                                    removed_id,
+                                    key_path,
+                                    key,
+                                )
                             continue
                     except er.MultipleInvalid as e:
                         exception_errors.extend(e.errors)
@@ -412,7 +556,7 @@ class Schema(object):
 
         return validate_mapping
 
-    def _compile_object(self, schema):
+    def _compile_object(self, schema, support=None):
         """Validate an object.
 
         Has the same behavior as dictionary validator but work with object
@@ -430,7 +574,9 @@ class Schema(object):
             ...   validate(Structure(one='three'))
 
         """
-        base_validate = self._compile_mapping(schema, invalid_msg='object value')
+        base_validate = self._compile_mapping(
+            schema, invalid_msg='object value', support=support
+        )
 
         def validate_object(path, data):
             if schema.cls is not UNDEFINED and not isinstance(data, schema.cls):
@@ -442,7 +588,7 @@ class Schema(object):
 
         return validate_object
 
-    def _compile_dict(self, schema):
+    def _compile_dict(self, schema, support=None):
         """Validate a dictionary.
 
         A dictionary schema can contain a set of values, or at most one
@@ -518,7 +664,9 @@ class Schema(object):
          "expected str for dictionary value @ data['adict']['strfield']"]
 
         """
-        base_validate = self._compile_mapping(schema, invalid_msg='dictionary value')
+        base_validate = self._compile_mapping(
+            schema, invalid_msg='dictionary value', support=support
+        )
 
         groups_of_exclusion = {}
         groups_of_inclusion = {}
@@ -577,7 +725,7 @@ class Schema(object):
 
         return validate_dict
 
-    def _compile_sequence(self, schema, seq_type):
+    def _compile_sequence(self, schema, seq_type, support=None):
         """Validate a sequence type.
 
         This is a sequence of valid values or validators tried in order.
@@ -590,7 +738,15 @@ class Schema(object):
         >>> validator([1])
         [1]
         """
-        _compiled = [self._compile(s) for s in schema]
+        if support is not None:
+            _compiled = [
+                self._compile_with(
+                    s, support.child('item[%d]' % index)
+                )
+                for index, s in enumerate(schema)
+            ]
+        else:
+            _compiled = [self._compile(s) for s in schema]
         seq_type_name = seq_type.__name__
 
         def validate_sequence(path, data):
@@ -617,6 +773,17 @@ class Schema(object):
                         cval = validate(index_path, value)
                         if cval is not Remove:  # do not include Remove values
                             out.append(cval)
+                        else:
+                            removed_id = getattr(
+                                validate, '_trace_node_id', None
+                            )
+                            if removed_id is not None:
+                                _trace._TraceSupport.emit(
+                                    _trace.REMOVED,
+                                    removed_id,
+                                    index_path,
+                                    value,
+                                )
                         break
                     except er.Invalid as e:
                         if len(e.path) > len(index_path):
@@ -634,7 +801,7 @@ class Schema(object):
 
         return validate_sequence
 
-    def _compile_tuple(self, schema):
+    def _compile_tuple(self, schema, support=None):
         """Validate a tuple.
 
         A tuple is a sequence of valid values or validators tried in order.
@@ -647,9 +814,9 @@ class Schema(object):
         >>> validator((1,))
         (1,)
         """
-        return self._compile_sequence(schema, tuple)
+        return self._compile_sequence(schema, tuple, support)
 
-    def _compile_list(self, schema):
+    def _compile_list(self, schema, support=None):
         """Validate a list.
 
         A list is a sequence of valid values or validators tried in order.
@@ -662,9 +829,9 @@ class Schema(object):
         >>> validator([1])
         [1]
         """
-        return self._compile_sequence(schema, list)
+        return self._compile_sequence(schema, list, support)
 
-    def _compile_set(self, schema):
+    def _compile_set(self, schema, support=None):
         """Validate a set.
 
         A set is an unordered collection of unique elements.
@@ -679,12 +846,35 @@ class Schema(object):
         """
         type_ = type(schema)
         type_name = type_.__name__
+        # Deterministic, ordering-independent ranks for set members: the
+        # production loop iterates members in schema order, while traced
+        # builds assign structural ids from a stable label sort so that
+        # hash-seeded set iteration cannot reshuffle node identity.
+        if support is not None:
+            ordered = sorted(schema, key=lambda member: _structural_label(member))
+            rank = {
+                id(member): rank_
+                for rank_, member in enumerate(ordered)
+            }
+            compiled_by_id = {
+                id(member): self._compile_with(
+                    member,
+                    support.child('member[%d]' % rank[id(member)]),
+                )
+                for member in ordered
+            }
+        else:
+            compiled_by_id = None
 
         def validate_set(path, data):
             if not isinstance(data, type_):
                 raise er.Invalid('expected a %s' % type_name, path)
 
-            _compiled = [self._compile(s) for s in schema]
+            _compiled = (
+                [compiled_by_id[id(member)] for member in schema]
+                if compiled_by_id is not None
+                else [self._compile(member) for member in schema]
+            )
             errors = []
             out = set()
             for value in data:
@@ -693,6 +883,17 @@ class Schema(object):
                         cval = validate(path, value)
                         if cval is not Remove:  # do not include Remove values
                             out.add(cval)
+                        else:
+                            removed_id = getattr(
+                                validate, '_trace_node_id', None
+                            )
+                            if removed_id is not None:
+                                _trace._TraceSupport.emit(
+                                    _trace.REMOVED,
+                                    removed_id,
+                                    path + [value],
+                                    value,
+                                )
                         break
                     except er.Invalid:
                         pass
@@ -806,7 +1007,7 @@ class Schema(object):
         return result
 
 
-def _compile_scalar(schema):
+def _compile_scalar(schema, support=None):
     """A scalar value.
 
     The schema can either be a value or a type.
@@ -837,9 +1038,42 @@ def _compile_scalar(schema):
         return validate_instance
 
     if callable(schema):
+        traced_target = None
+        if support is not None:
+            if isinstance(schema, Schema):
+                # A nested Schema value: delegate to its own instrumented
+                # compilation so its internal nodes are observed too.
+                clone = type(schema)._traced_new(
+                    schema.schema, schema.required, schema.extra
+                )
+                nested = clone._trace_support
+                nested_root = nested
+
+                def traced_target(data, _nested=nested):
+                    return _nested.compiled([], data)
+            elif isinstance(schema, Marker):
+                traced_schema = type(schema)._traced_new(
+                    schema._schema.schema,
+                    schema._schema.required,
+                    schema._schema.extra,
+                )._trace_support
+
+                def traced_target(data, _schema=schema, _nested=traced_schema):
+                    return _run_traced_marker(_schema, data, _nested)
+            elif isinstance(schema, Msg):
+                traced_schema = type(schema.schema)._traced_new(
+                    schema.schema.schema,
+                    schema.schema.required,
+                    schema.schema.extra,
+                )._trace_support
+
+                def traced_target(data, _schema=schema, _nested=traced_schema):
+                    return _run_traced_msg(_schema, data, _nested)
 
         def validate_callable(path, data):
             try:
+                if traced_target is not None:
+                    return traced_target(data)
                 return schema(data)
             except ValueError:
                 raise er.ValueInvalid('not a valid value', path)
